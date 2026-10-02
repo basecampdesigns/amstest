@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Business Jet — 3D Blueprint</title>
+<!--
+  Standalone 3D blueprint aircraft for embedding (e.g. a Wix "Embed HTML" element).
+  - Transparent background: place it over any section colour.
+  - Auto-plays when scrolled into view: draws in from a top-down view, then the camera
+    orbits down to a three-quarter side view and drifts gently.
+  - Drag to rotate (mouse: both axes; touch: left/right, so page scrolling still works).
+
+  Optional URL parameters:
+    ?theme=light     navy lines on white surfaces (for light backgrounds). Default: dark.
+    ?line=cfe2ff     line colour (hex, no #)
+    ?fill=14335f     surface colour (hex, no #), or fill=none for a pure wireframe
+    ?autoplay=0      skip the intro and start in the settled view
+    ?drift=0         turn off the idle drift
+  Example: index.html?theme=light&line=0b2447
+-->
+<style>
+  html,body{margin:0;height:100%;background:transparent;overflow:hidden}
+  canvas{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:grab;touch-action:pan-y;-webkit-tap-highlight-color:transparent}
+  canvas.dragging{cursor:grabbing}
+  #fb{display:none}
+</style>
+</head>
+<body>
+<canvas id="gl" aria-label="Rotatable 3D blueprint of a business jet" role="img"></canvas>
+<canvas id="fb" aria-hidden="true"></canvas>
+
+<script>
+/* ---------------------------------------------------------------------------------------
+   1. Geometry source — side profile and plan-view outlines (SVG path data).
+      SIDE: 1000 × 300 box, nose right, wheels on y = 272.  PLAN: 400 × 430 box, nose up.
+   --------------------------------------------------------------------------------------- */
+const JET = {
+  side: {
+    fus:   'M164,190 C200,172 270,158 347,156 L851,156 C868,160 885,170 899,182 C914,192 930,200 940,206 C934,212 918,218 899,221 C885,224 870,225.6 851,225.6 L725,225.6 C700,226 675,229 662,232 C652,236 645,243 628,244 L505,246 C470,244 440,240 400,234 C380,231 368,229 347,226 C300,220 230,209 190,199 C178,196 168,193 164,190 Z',
+    tailv: 'M164,192 L151,156 L139,128 L120,76 C114,72 106,70 101,70 L197,69 C206,86 214,98 221,107 C230,118 240,132 252,142 C262,148 275,151 300,153 C315,154 330,155 347,156 C270,160 200,174 164,192 Z',
+  },
+  plan: {
+    fus:    'M200,15 C204,16 210,26 212,34 C215,45 217,58 217.5,75 L217.5,262 C217.5,292 212,322 205.5,342 L202.5,405 L200,414 L197.5,405 L194.5,342 C188,322 182.5,292 182.5,262 L182.5,75 C183,58 185,45 188,34 C190,26 196,16 200,15 Z',
+    wingR:  'M217.5,148 L372.8,275.5 C377.5,281 380.5,288 382,296 L385.5,315 L378,298 L236.8,239.7 L217.5,234.7 Z',
+    flapR:  'M221,229 L371,291',
+    hstabR: 'M205,358 L226,368.5 L256.9,390 L264.8,397 L266.5,412 L254.8,411.4 L234,404.3 L204,398 Z',
+  },
+};
+
+/* ---------------------------------------------------------------------------------------
+   2. 3D model — lofted from the outlines above.
+      Model space (right-handed): X forward (60 → 940), Y to port, Z up (Z = 0 is the ground).
+   --------------------------------------------------------------------------------------- */
+const K = 2.2037;                                  // plan units → model units
+const clamp = (v, a = 0, b = 1) => Math.min(b, Math.max(a, v));
+const ringPts = (n, f) => { const r = []; for (let i = 0; i <= n; i++) r.push(f(i / n * Math.PI * 2)); return r; };
+
+function buildModel() {
+  const NS = 'http://www.w3.org/2000/svg', svg = document.createElementNS(NS, 'svg');
+  svg.style.cssText = 'position:absolute;width:0;height:0;visibility:hidden'; document.body.append(svg);
+  const sample = (d, n) => {
+    const p = document.createElementNS(NS, 'path'); p.setAttribute('d', d); svg.append(p);
+    const L = p.getTotalLength(), out = [];
+    for (let i = 0; i <= n; i++) { const q = p.getPointAtLength(L * i / n); out.push([q.x, q.y]); }
+    p.remove(); return out;
+  };
+  const planToModel = ([px, py]) => [940 - (py - 15) * K, -(px - 200) * K];
+
+  // fuselage cross-sections: top/bottom from the side profile, half-width from the plan
+  const sFus = sample(JET.side.fus, 2400), pFus = sample(JET.plan.fus, 1600).map(planToModel);
+  const section = X => {
+    let top = 1e9, bot = -1e9, w = 0;
+    for (const [x, y] of sFus) if (Math.abs(x - X) < 2.2) { top = Math.min(top, y); bot = Math.max(bot, y); }
+    for (const [x, y] of pFus) if (Math.abs(x - X) < 3.5) w = Math.max(w, Math.abs(y));
+    return top < 1e8 ? { X, zt: 272 - top, zb: 272 - bot, w } : null;
+  };
+  const stations = [];
+  for (let X = 170; X <= 930; X += 10) { const s = section(X); if (s) stations.push(s); }
+  [934, 937].forEach(X => { const s = section(X); if (s) stations.push(s); });
+  const TIP = [940, 0, 66];
+  const sp = v => Math.sign(v) * Math.pow(Math.abs(v), 2 / 2.5);   // superellipse section
+  const pt = (s, th) => [s.X, s.w * sp(Math.sin(th)), (s.zt + s.zb) / 2 + (s.zt - s.zb) / 2 * sp(Math.cos(th))];
+  const halfWidth = X => stations.reduce((b, s) => Math.abs(s.X - X) < Math.abs(b.X - X) ? s : b).w;
+
+  const lines = [];
+  for (let k = 0; k < 12; k++) {
+    const th = k / 12 * Math.PI * 2;
+    lines.push({ pts: [...stations.map(s => pt(s, th)), TIP], a: k % 3 === 0 ? .9 : .45, g: 0 });
+  }
+  stations.filter((s, i) => i % 7 === 3 || s.X > 925).forEach(s => lines.push({ pts: ringPts(40, th => pt(s, th)), a: .38, g: 1 }));
+
+  // wings (~3.4° dihedral) + flap line
+  const wing = sample(JET.plan.wingR, 140).map(planToModel), flap = sample(JET.plan.flapR, 30).map(planToModel);
+  const zWing = y => 58 + Math.max(0, Math.abs(y) - 38) * .06;
+  [1, -1].forEach(m => {
+    lines.push({ pts: wing.map(([x, y]) => [x, y * m, zWing(y)]), a: 1, g: 2 });
+    lines.push({ pts: flap.map(([x, y]) => [x, y * m, zWing(y) + .5]), a: .5, g: 2 });
+  });
+  // T-tail
+  const stab = sample(JET.plan.hstabR, 70).map(planToModel);
+  [1, -1].forEach(m => lines.push({ pts: stab.map(([x, y]) => [x, y * m, 186]), a: 1, g: 3 }));
+  const finOutline = sample(JET.side.tailv, 200).map(([x, y]) => [x, 272 - y]);
+  lines.push({ pts: finOutline.map(([x, z]) => [x, 0, z]), a: 1, g: 3 });
+  // engine nacelles
+  const NAC = [[224, 11, 9], [236, 21, 18], [252, 23, 20], [300, 25, 21], [350, 25, 21], [372, 24.5, 20.5], [383, 23, 19]];
+  const ENG_Y = 61.7, ENG_Z = 93;
+  [1, -1].forEach(m => {
+    const yc = ENG_Y * m, at = (st, th) => [st[0], yc + st[2] * Math.sin(th), ENG_Z + st[1] * Math.cos(th)];
+    for (let k = 0; k < 8; k++) { const th = k / 8 * Math.PI * 2; lines.push({ pts: NAC.map(st => at(st, th)), a: .55, g: 4 }); }
+    [NAC[1], NAC[3], NAC[6]].forEach(st => lines.push({ pts: ringPts(32, th => at(st, th)), a: .8, g: 4 }));
+  });
+  // cabin windows, door and cockpit glazing on both sides
+  for (let i = 0; i < 10; i++) {
+    const X = 444.3 + i * 35, w = halfWidth(X) * 1.004;
+    [1, -1].forEach(m => lines.push({ pts: ringPts(20, a => [X + 10 * Math.cos(a), w * m, 87 + 8 * Math.sin(a)]), a: .8, g: 5 }));
+  }
+  [1, -1].forEach(m => {
+    const wd = halfWidth(816) * 1.004 * m, wc = halfWidth(862) * m, ws = halfWidth(880) * .98 * m;
+    lines.push({ pts: [[804, wd, 110], [828, wd, 110], [828, wd, 57], [804, wd, 57], [804, wd, 110]], a: .6, g: 5 });
+    lines.push({ pts: [[845, wc, 107], [867, wc, 107], [867, wc, 96], [845, wc, 96], [845, wc, 107]], a: .7, g: 5 });
+    lines.push({ pts: [[871, ws, 106], [880, ws * .95, 104], [891, ws * .85, 95], [871, ws, 95], [871, ws, 106]], a: .7, g: 5 });
+  });
+  // landing gear
+  const wheel = (x, y, z, r) => ringPts(20, a => [x + r * Math.cos(a), y, z + r * Math.sin(a)]);
+  lines.push({ pts: [[877, 0, 48], [890, 0, 20]], a: .8, g: 6 });
+  [-4, 4].forEach(o => lines.push({ pts: wheel(891, o, 10, 10), a: .8, g: 6 }));
+  [1, -1].forEach(m => {
+    lines.push({ pts: [[489, 36 * m, 34], [489, 36 * m, 22]], a: .8, g: 6 });
+    [-5, 5].forEach(o => lines.push({ pts: wheel(489, 36 * m + o, 11, 11), a: .8, g: 6 }));
+  });
+  svg.remove();
+
+  lines.forEach(l => {
+    l.cum = [0];
+    for (let i = 1; i < l.pts.length; i++) {
+      const [a, b] = [l.pts[i - 1], l.pts[i]];
+      l.cum.push(l.cum[i - 1] + Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]));
+    }
+    l.len = l.cum[l.cum.length - 1];
+  });
+  lines.sort((a, b) => a.g - b.g);
+  return { lines, surfaces: { stations, pt, TIP, wing, stab, zWing, finOutline, NAC, ENG_Y, ENG_Z } };
+}
+
+/* ---------------------------------------------------------------------------------------
+   3. Camera — spin (yaw about the vertical axis) then tilt (camera elevation).
+      spin = tilt = 0 → top view, nose up.  spin = tilt = −90° → level side view, nose right.
+   --------------------------------------------------------------------------------------- */
+const CENTER = [500, 0, 81], F = 1800;
+function basis(spin, tilt) {
+  const cs = Math.cos(spin), ss = Math.sin(spin), ct = Math.cos(tilt), st = Math.sin(tilt);
+  return { r: [-ss, -cs, 0], u: [ct * cs, -ct * ss, -st], v: [st * cs, -st * ss, ct] };
+}
+
+/* ---------------------------------------------------------------------------------------
+   4. Settings from the URL
+   --------------------------------------------------------------------------------------- */
+const Q = new URLSearchParams(location.search);
+const LIGHT = Q.get('theme') === 'light';
+const hex = (s, d) => /^[0-9a-f]{6}$/i.test(s || '') ? '#' + s : d;
+const OPT = {
+  line: hex(Q.get('line'), LIGHT ? '#0f2a52' : '#cfe2ff'),
+  fill: Q.get('fill') === 'none' ? null : hex(Q.get('fill'), LIGHT ? '#ffffff' : '#14335f'),
+  light: LIGHT,
+  autoplay: Q.get('autoplay') !== '0',
+  drift: Q.get('drift') !== '0',
+};
+const MODEL = buildModel();
+</script>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+
+<script type="module">
+/* ---------------------------------------------------------------------------------------
+   5. Renderers — WebGL hidden-line render (solid surfaces hide what's behind them),
+      with a see-through 2D canvas fallback if WebGL isn't available.
+   --------------------------------------------------------------------------------------- */
+let renderer3D = null;
+try {
+  const THREE = await import('three');
+  const { Line2 } = await import('three/addons/lines/Line2.js');
+  const { LineMaterial } = await import('three/addons/lines/LineMaterial.js');
+  const { LineGeometry } = await import('three/addons/lines/LineGeometry.js');
+  renderer3D = createGL(THREE, Line2, LineMaterial, LineGeometry);
+} catch (e) {
+  console.warn('WebGL unavailable — using the 2D wireframe fallback', e);
+  renderer3D = create2D();
+}
+
+function createGL(THREE, Line2, LineMaterial, LineGeometry) {
+  const canvas = document.getElementById('gl');
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true, premultipliedAlpha: false });
+  renderer.setClearColor(0x000000, 0);
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(20, 1, 1, 10); camera.matrixAutoUpdate = false;
+  scene.add(new THREE.HemisphereLight(OPT.light ? 0xffffff : 0x9cc3ff, OPT.light ? 0xc9d3df : 0x06142c, OPT.light ? .9 : .55));
+  const key = new THREE.DirectionalLight(OPT.light ? 0xffffff : 0xbfd8ff, OPT.light ? .25 : .35); scene.add(key, key.target);
+
+  const S = MODEL.surfaces, C = new THREE.Vector3(...CENTER);
+  const skin = OPT.fill && new THREE.MeshLambertMaterial({
+    color: new THREE.Color(OPT.fill), emissive: new THREE.Color(OPT.fill).multiplyScalar(OPT.light ? .85 : .55),
+    side: THREE.DoubleSide, transparent: true, opacity: 0, polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 2,
+  });
+  const addMesh = (pos, idx) => {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.setIndex(idx); g.computeVertexNormals();
+    scene.add(new THREE.Mesh(g, skin));
+  };
+  if (skin) {
+    { // fuselage
+      const A = 48, rows = S.stations.length, pos = [], idx = [];
+      S.stations.forEach(s => { for (let k = 0; k < A; k++) pos.push(...S.pt(s, k / A * Math.PI * 2)); });
+      const tip = rows * A; pos.push(...S.TIP);
+      for (let r = 0; r < rows - 1; r++) for (let k = 0; k < A; k++) { const a = r * A + k, b = r * A + (k + 1) % A; idx.push(a, a + A, b, b, a + A, b + A); }
+      for (let k = 0; k < A; k++) idx.push((rows - 1) * A + k, tip, (rows - 1) * A + (k + 1) % A);
+      const tail = pos.length / 3, s0 = S.stations[0]; pos.push(s0.X, 0, (s0.zt + s0.zb) / 2);
+      for (let k = 0; k < A; k++) idx.push(tail, k, (k + 1) % A);
+      addMesh(pos, idx);
+    }
+    const planar = (outline, zOf) => {
+      const g = new THREE.ShapeGeometry(new THREE.Shape(outline.map(([x, y]) => new THREE.Vector2(x, y))), 1);
+      const p = g.attributes.position; for (let i = 0; i < p.count; i++) p.setZ(i, zOf(p.getX(i), p.getY(i)));
+      g.computeVertexNormals(); scene.add(new THREE.Mesh(g, skin));
+    };
+    [1, -1].forEach(m => {
+      planar(S.wing.map(([x, y]) => [x, y * m]), (x, y) => S.zWing(y));
+      planar(S.stab.map(([x, y]) => [x, y * m]), () => 186);
+    });
+    { const g = new THREE.ShapeGeometry(new THREE.Shape(S.finOutline.map(([x, z]) => new THREE.Vector2(x, z))), 1);
+      g.rotateX(Math.PI / 2); g.computeVertexNormals(); scene.add(new THREE.Mesh(g, skin)); }
+    [1, -1].forEach(m => { // nacelles
+      const A = 32, pos = [], idx = [], yc = S.ENG_Y * m, R = S.NAC.length;
+      S.NAC.forEach(st => { for (let k = 0; k < A; k++) { const th = k / A * Math.PI * 2; pos.push(st[0], yc + st[2] * Math.sin(th), S.ENG_Z + st[1] * Math.cos(th)); } });
+      for (let r = 0; r < R - 1; r++) for (let k = 0; k < A; k++) { const a = r * A + k, b = r * A + (k + 1) % A; idx.push(a, a + A, b, b, a + A, b + A); }
+      [0, R - 1].forEach(r => { const c = pos.length / 3; pos.push(S.NAC[r][0], yc, S.ENG_Z); for (let k = 0; k < A; k++) idx.push(c, r * A + k, r * A + (k + 1) % A); });
+      addMesh(pos, idx);
+    });
+  }
+
+  const lineObjs = MODEL.lines.map(l => {
+    const geo = new LineGeometry(); geo.setPositions(l.pts.flat());
+    const mat = new LineMaterial({ color: new THREE.Color(OPT.line), linewidth: 1.2, transparent: true, opacity: l.a, depthWrite: false });
+    const obj = new Line2(geo, mat); obj.renderOrder = 2; scene.add(obj);
+    const c = l.pts.reduce((s, p) => [s[0] + p[0], s[1] + p[1], s[2] + p[2]], [0, 0, 0]).map(v => v / l.pts.length);
+    return { obj, mat, geo, segs: l.pts.length - 1, a: l.a, c: new THREE.Vector3(...c) };
+  });
+
+  let W = 0, H = 0, lastKey = '';
+  function resize() {
+    W = canvas.clientWidth; H = canvas.clientHeight;
+    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+    renderer.setSize(W, H, false);
+    lineObjs.forEach(o => o.mat.resolution.set(W, H));
+    lastKey = '';
+  }
+  resize(); addEventListener('resize', resize);
+
+  function draw({ spin, tilt, scale, cx, cy, persp, reveal }) {
+    const k = [spin, tilt, scale, cx, cy, persp, reveal].map(v => (+v).toFixed(4)).join('|');
+    if (k === lastKey) return; lastKey = k;
+    if (canvas.clientWidth !== W || canvas.clientHeight !== H) resize();
+    const B = basis(spin, tilt);
+    const eR = new THREE.Vector3(...B.r), eU = new THREE.Vector3(...B.u), eV = new THREE.Vector3(...B.v);
+    const D = F / Math.max(persp, .02), pos = C.clone().addScaledVector(eV, D);
+    camera.matrixWorld.makeBasis(eR, eU, eV).setPosition(pos);
+    camera.matrixWorldInverse.copy(camera.matrixWorld).invert();
+    camera.near = Math.max(1, D - 1400); camera.far = D + 1400; camera.aspect = W / H;
+    camera.fov = 2 * Math.atan(H / (2 * D * scale)) * 180 / Math.PI;
+    camera.updateProjectionMatrix();
+    camera.projectionMatrix.elements[8] = -((cx - W / 2) / (W / 2));
+    camera.projectionMatrix.elements[9] = (cy - H / 2) / (H / 2);
+    camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+    key.position.copy(pos).addScaledVector(eU, 900); key.target.position.copy(C);
+    if (skin) { skin.opacity = clamp((reveal - .55) / .35); skin.depthWrite = skin.opacity > .02; }
+
+    const N = lineObjs.length; let lo = Infinity, hi = -Infinity;
+    const depth = lineObjs.map(l => { const d = l.c.clone().sub(C).dot(eV); lo = Math.min(lo, d); hi = Math.max(hi, d); return d; });
+    lineObjs.forEach((l, i) => {
+      const a0 = i / N * .55, kk = clamp((reveal - a0) / .45), shown = Math.ceil(l.segs * (1 - Math.pow(1 - kk, 3)));
+      l.obj.visible = shown > 0; l.geo.instanceCount = shown;
+      l.mat.opacity = Math.min(1, l.a * (.45 + .55 * (depth[i] - lo) / Math.max(1, hi - lo)));
+    });
+    renderer.render(scene, camera);
+  }
+  return { draw, canvas };
+}
+
+function create2D() {
+  const canvas = document.getElementById('fb'); canvas.style.display = 'block';
+  document.getElementById('gl').style.display = 'none';
+  const ctx = canvas.getContext('2d'); let dpr = 1, lastKey = '';
+  const rgb = OPT.line.slice(1).match(/../g).map(h => parseInt(h, 16)).join(',');
+  function resize() { dpr = Math.min(2, devicePixelRatio || 1); canvas.width = canvas.clientWidth * dpr; canvas.height = canvas.clientHeight * dpr; lastKey = ''; }
+  resize(); addEventListener('resize', resize);
+  function draw({ spin, tilt, scale, cx, cy, persp, reveal }) {
+    const k = [spin, tilt, scale, cx, cy, persp, reveal].map(v => (+v).toFixed(4)).join('|');
+    if (k === lastKey) return; lastKey = k;
+    const B = basis(spin, tilt);
+    const proj = P => {
+      const x = P[0] - CENTER[0], y = P[1] - CENTER[1], z = P[2] - CENTER[2];
+      const r = B.r[0] * x + B.r[1] * y + B.r[2] * z, u = B.u[0] * x + B.u[1] * y + B.u[2] * z, v = B.v[0] * x + B.v[1] * y + B.v[2] * z;
+      const f = F / (F - v * persp); return [cx + r * scale * f, cy - u * scale * f];
+    };
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, canvas.width, canvas.height); ctx.lineWidth = 1;
+    const N = MODEL.lines.length;
+    MODEL.lines.forEach((l, i) => {
+      const a0 = i / N * .55, kk = clamp((reveal - a0) / .45); if (kk <= 0) return;
+      const upto = l.len * (1 - Math.pow(1 - kk, 3)), P = l.pts.map(proj);
+      ctx.strokeStyle = `rgba(${rgb},${(l.a * .75).toFixed(2)})`; ctx.beginPath(); ctx.moveTo(...P[0]);
+      for (let j = 1; j < P.length && l.cum[j - 1] < upto; j++) ctx.lineTo(...P[j]);
+      ctx.stroke();
+    });
+  }
+  return { draw, canvas };
+}
+
+/* ---------------------------------------------------------------------------------------
+   6. Motion — intro when visible, idle drift, drag to rotate with inertia.
+   --------------------------------------------------------------------------------------- */
+const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const ease = t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+const seg = (p, a, b) => clamp((p - a) / (b - a));
+const INTRO_MS = 4000;
+const REST = { spin: -Math.PI / 2 - .2, tilt: -Math.PI / 2 + .16, persp: .5 };   // settled three-quarter view
+const TILT_MIN = -Math.PI / 2 - .08, TILT_MAX = -.05;
+
+let introT = (!OPT.autoplay || reduce) ? 1 : 0, started = introT === 1, visible = true;
+let yaw = 0, pitch = 0, vYaw = 0, vPitch = 0, dragging = false, lastX = 0, lastY = 0, lastInput = -1e9, driftAmp = 0;
+const target = renderer3D.canvas;
+
+new IntersectionObserver(es => es.forEach(e => {
+  visible = e.isIntersecting;
+  if (visible && e.intersectionRatio >= .3) started = true;
+}), { threshold: [0, .3] }).observe(document.body);
+
+target.addEventListener('pointerdown', e => {
+  dragging = true; lastX = e.clientX; lastY = e.clientY; vYaw = vPitch = 0; lastInput = performance.now();
+  target.setPointerCapture(e.pointerId); target.classList.add('dragging');
+  if (introT < 1) started = true;
+});
+target.addEventListener('pointermove', e => {
+  if (!dragging) return;
+  const dx = e.clientX - lastX, dy = e.clientY - lastY; lastX = e.clientX; lastY = e.clientY;
+  vYaw = -dx * .0065; vPitch = e.pointerType === 'mouse' ? dy * .0045 : 0;
+  yaw += vYaw; pitch += vPitch; lastInput = performance.now();
+});
+const endDrag = e => { dragging = false; target.classList.remove('dragging'); lastInput = performance.now(); };
+target.addEventListener('pointerup', endDrag); target.addEventListener('pointercancel', endDrag);
+
+window.__jetState = () => ({ introT, started, visible, yaw, pitch, driftAmp, renderer: renderer3D.canvas.id }); // read-only status, handy for debugging
+
+let prev = performance.now();
+function frame(now) {
+  const dt = Math.min(64, now - prev); prev = now;
+  if (visible) {
+    const W = target.clientWidth, H = target.clientHeight;
+    if (started && introT < 1) introT = Math.min(1, introT + dt / INTRO_MS * (dragging ? 6 : 1));
+    // inertia after release
+    if (!dragging) { yaw += vYaw; pitch += vPitch; vYaw *= .93; vPitch *= .9; }
+    // idle drift fades in a few seconds after the last interaction
+    const idle = now - lastInput > 2500 && introT >= 1 && OPT.drift && !reduce;
+    driftAmp += ((idle ? 1 : 0) - driftAmp) * Math.min(1, dt / 1500);
+    const drift = driftAmp * .2 * Math.sin(now / 16000 * Math.PI * 2);
+
+    const t = introT, move = seg(t, .28, .78);
+    const k0 = .8 * Math.min(H / 900, W / 840), k1 = .86 * Math.min(W / 1060, H / 560);
+    const tilt = clamp(REST.tilt * ease(seg(t, .32, .78)) + pitch, TILT_MIN, TILT_MAX);
+    renderer3D.draw({
+      spin: REST.spin * ease(seg(t, .28, .72)) + yaw + drift,
+      tilt,
+      scale: k0 + (k1 - k0) * ease(seg(t, .3, .78)),
+      cx: W / 2, cy: H * .53,
+      persp: REST.persp * ease(move) + .45 * Math.sin(Math.PI * move),
+      reveal: started ? seg(t, 0, .32) : 0,
+    });
+    pitch = tilt - REST.tilt * ease(seg(t, .32, .78));   // keep pitch inside the allowed range
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
